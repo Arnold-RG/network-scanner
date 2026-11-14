@@ -1,110 +1,93 @@
 <#
 .SYNOPSIS
-    Discover live hosts on a local IPv4 subnet.
+    Discover live hosts on a local IPv4 subnet (v2): IP, MAC, vendor, hostname, open ports.
 
 .DESCRIPTION
-    scan-network.ps1 ping-sweeps a CIDR range, resolves reverse-DNS hostnames
-    and runs a quick TCP connect check of common ports on every live host.
-    Probes run in parallel through a runspace pool, so the script works on
-    Windows PowerShell 5.1 and PowerShell 7+ without extra modules.
-
-    A host counts as "live" when it answers ICMP echo OR any TCP probe
-    (an actively refused connection still proves the host is up).
+    scan-network.ps1 sweeps a CIDR range on a runspace pool (Windows PowerShell
+    5.1 and PowerShell 7+, no extra modules) and combines three discovery methods:
+      * ICMP echo
+      * TCP connect - an open OR actively refused port proves the host is up
+      * ARP / neighbour table - every host that answered ARP is on the segment
+    Live hosts are enriched with MAC address + OUI vendor, a hostname from DNS
+    (and NetBIOS via nbtstat on Windows) and a quick check of the top ports.
+    Results go to the console, the pipeline and optional CSV/JSON/HTML reports.
 
     Author : Arnold Rurangwa - MIT License
     Legal  : Only scan networks you own or are explicitly authorised to test.
 
 .PARAMETER Target
-    Network in CIDR notation (192.168.1.0/24) or a single IPv4 address.
-    Prefixes from /16 to /32 are accepted.
-
+    Network in CIDR notation (192.168.1.0/24, /16 to /32) or a single IPv4 address.
 .PARAMETER Ports
-    Ports to check on live hosts. Default: 22,53,80,135,139,443,445,3389,8080.
-
-.PARAMETER Threads
-    Number of parallel probes (1-256). Default: 64.
-
-.PARAMETER TimeoutMs
-    Per-probe timeout in milliseconds (100-30000). Default: 1000.
-
-.PARAMETER CsvPath
-    Optional path of a CSV file to write the results to.
-
+    Ports checked on live hosts. Default: top 20 TCP ports.
 .PARAMETER NoPortScan
-    Discovery only; skip the port check.
+    Discovery only.
+.PARAMETER Methods
+    Discovery methods: icmp, tcp, arp (default all three).
+.PARAMETER Threads
+    Parallel probes, 1-256. Default 64.
+.PARAMETER TimeoutMs
+    Per-probe timeout in milliseconds, 100-30000. Default 1000.
+.PARAMETER OutputPath
+    One or more report files; format from the extension (.csv, .json, .html).
+.PARAMETER ConfigPath
+    KEY=VALUE config file (config/network-scanner.conf). Parameters override it.
+.PARAMETER NeighborFile
+    Read the ARP table from a saved `arp -a` / `ip neigh` dump instead of the live one.
+.PARAMETER LogPath
+    Append log lines to this file.
+.PARAMETER LogLevel
+    DEBUG, INFO, WARN or ERROR. Default INFO.
 
 .EXAMPLE
     .\scan-network.ps1 -Target 192.168.1.0/24
-
 .EXAMPLE
-    .\scan-network.ps1 -Target 10.0.0.0/28 -Ports 22,80 -Threads 32 -CsvPath lan.csv
+    .\scan-network.ps1 -Target 192.168.1.0/24 -OutputPath lan.html, lan.csv
+.EXAMPLE
+    .\scan-network.ps1 192.168.1.0/24 | Where-Object Vendor -match 'Raspberry'
 
 .NOTES
     Requirements: Windows PowerShell 5.1+ or PowerShell 7+. No admin rights needed.
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true, Position = 0)]
-    [ValidatePattern('^\d{1,3}(\.\d{1,3}){3}(/\d{1,2})?$')]
-    [string]$Target,
-
-    [ValidateRange(1, 65535)]
-    [int[]]$Ports = @(22, 53, 80, 135, 139, 443, 445, 3389, 8080),
-
-    [ValidateRange(1, 256)]
-    [int]$Threads = 64,
-
-    [ValidateRange(100, 30000)]
-    [int]$TimeoutMs = 1000,
-
-    [string]$CsvPath,
-
-    [switch]$NoPortScan
+    [Parameter(Mandatory = $true, Position = 0)][string]$Target,
+    [ValidateRange(1, 65535)][int[]]$Ports,
+    [switch]$NoPortScan,
+    [ValidateSet('icmp', 'tcp', 'arp')][string[]]$Methods,
+    [ValidateRange(1, 256)][int]$Threads,
+    [ValidateRange(100, 30000)][int]$TimeoutMs,
+    [string[]]$OutputPath = @(),
+    [string]$ConfigPath,
+    [string]$NeighborFile,
+    [string]$LogPath,
+    [ValidateSet('DEBUG', 'INFO', 'WARN', 'ERROR')][string]$LogLevel
 )
-
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+Import-Module (Join-Path $PSScriptRoot 'lib/Common.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'lib/NetTools.psm1') -Force
 
-# ---- CIDR helpers ------------------------------------------------------------
-function ConvertTo-UInt32 {
-    param([string]$Ip)
-    $bytes = ([System.Net.IPAddress]::Parse($Ip)).GetAddressBytes()
-    [Array]::Reverse($bytes)                       # network -> host byte order
-    return [BitConverter]::ToUInt32($bytes, 0)
-}
+# ---- configuration: defaults < config file < parameters -----------------------
+$cfg = @{}
+if ($ConfigPath) { $cfg = Import-ToolConfig -Path $ConfigPath }
+if (-not $LogLevel) { $LogLevel = Get-ConfigValue $cfg 'LOG_LEVEL' 'INFO' }
+if (-not $LogPath) { $LogPath = Get-ConfigValue $cfg 'LOG_FILE' '' }
+Set-ToolLogging -Level $LogLevel -Path $LogPath
+if (-not $Ports) { $Ports = @((Get-ConfigValue $cfg 'PORTS' '21,22,23,25,53,80,110,111,135,139,143,443,445,993,995,1723,3306,3389,5900,8080').Split(',') | ForEach-Object { [int]$_ }) }
+if (-not $Methods) { $Methods = @((Get-ConfigValue $cfg 'METHODS' 'icmp,tcp,arp').Split(',')) }
+if (-not $Threads) { $Threads = [int](Get-ConfigValue $cfg 'JOBS' 64) }
+if (-not $TimeoutMs) { $TimeoutMs = 1000 * [int](Get-ConfigValue $cfg 'TIMEOUT' 1) }
+$discPorts = @((Get-ConfigValue $cfg 'TCP_DISCOVERY_PORTS' '80,443,22,445,139,3389').Split(',') | ForEach-Object { [int]$_ })
+$ouiPath = Get-ConfigValue $cfg 'OUI_FILE' 'data/oui-subset.csv'
+if (-not [System.IO.Path]::IsPathRooted($ouiPath)) { $ouiPath = Join-Path $PSScriptRoot $ouiPath }
+$useNetbios = (Get-ConfigValue $cfg 'RESOLVE_NETBIOS' '1') -eq '1'
 
-function ConvertTo-IpString {
-    param([uint32]$Value)
-    $bytes = [BitConverter]::GetBytes($Value)
-    [Array]::Reverse($bytes)
-    return ([System.Net.IPAddress]::new($bytes)).ToString()
-}
+$range = Get-CidrRange $Target
+if ($range.Count -gt 65536) { throw "Range too large ($($range.Count) hosts)." }
 
-$parts  = $Target.Split('/')
-$base   = $parts[0]
-$prefix = 32
-if ($parts.Count -eq 2) { $prefix = [int]$parts[1] }
-
-foreach ($octet in $base.Split('.')) {
-    if ([int]$octet -gt 255) { throw "Invalid IPv4 address: $base" }
-}
-if ($prefix -lt 16 -or $prefix -gt 32) { throw 'Prefix must be between /16 and /32.' }
-
-$baseInt = ConvertTo-UInt32 $base
-# Plain integer maths avoids signed-literal pitfalls (0xFFFFFFFF is -1 in PS).
-$block   = [uint64][math]::Pow(2, 32 - $prefix)     # addresses in the block
-$network = [uint64]$baseInt - ([uint64]$baseInt % $block)
-$bcast   = $network + $block - 1
-if ($prefix -ge 31) { $first = $network; $last = $bcast }
-else { $first = $network + 1; $last = $bcast - 1 }
-$count = [int]($last - $first + 1)
-if ($count -gt 65536) { throw "Range too large ($count hosts)." }
-
-# ---- per-host probe (runs inside a runspace) ----------------------------------
+# ---- per-host probe (self-contained: runs in its own runspace) -----------------
 $probe = {
-    param([string]$Ip, [int[]]$Ports, [int]$TimeoutMs, [bool]$NoPortScan)
-
-    # Returns 'open', 'closed' (refused => host is up) or 'filtered'.
+    param([string]$Ip, $A)
     function Test-Tcp([string]$HostIp, [int]$Port, [int]$Ms) {
         $client = New-Object System.Net.Sockets.TcpClient
         try {
@@ -112,88 +95,72 @@ $probe = {
             if (-not $async.AsyncWaitHandle.WaitOne($Ms)) { return 'filtered' }
             try { $client.EndConnect($async); return 'open' }
             catch {
-                $inner = $_.Exception.InnerException
-                if ($inner -is [System.Net.Sockets.SocketException] -and
-                    $inner.SocketErrorCode -eq 'ConnectionRefused') { return 'closed' }
+                $e = $_.Exception
+                while ($e -and -not ($e -is [System.Net.Sockets.SocketException])) { $e = $e.InnerException }
+                if ($e -and $e.SocketErrorCode -eq 'ConnectionRefused') { return 'closed' }
                 return 'filtered'
             }
-        }
-        finally { $client.Close() }
+        } finally { $client.Close() }
     }
-
-    $alive = $false
-    try {
-        $reply = (New-Object System.Net.NetworkInformation.Ping).Send($Ip, $TimeoutMs)
-        $alive = ($reply.Status -eq 'Success')
-    } catch { $alive = $false }   # ICMP may need privileges on some OSes
-
-    if (-not $alive) {
-        foreach ($p in 80, 443, 22, 445) {
-            if ((Test-Tcp $Ip $p $TimeoutMs) -ne 'filtered') { $alive = $true; break }
-        }
+    $via = $A.KnownVia
+    if (-not $via -and $A.Methods -contains 'icmp') {
+        try { if ((New-Object System.Net.NetworkInformation.Ping).Send($Ip, $A.TimeoutMs).Status -eq 'Success') { $via = 'icmp' } } catch { $via = $null }
     }
-    if (-not $alive) { return }
-
-    $name = '-'
-    try { $name = [System.Net.Dns]::GetHostEntry($Ip).HostName } catch { $name = '-' }
-    if ($name -eq $Ip) { $name = '-' }
-
+    if (-not $via -and $A.Methods -contains 'tcp') {
+        foreach ($p in $A.DiscPorts) { if ((Test-Tcp $Ip $p $A.TimeoutMs) -ne 'filtered') { $via = "tcp/$p"; break } }
+    }
+    if (-not $via) { return }
+    $name = '-'; $src = '-'
+    try { $n = [System.Net.Dns]::GetHostEntry($Ip).HostName; if ($n -and $n -ne $Ip) { $name = $n; $src = 'dns' } } catch { $name = '-' }
+    if ($name -eq '-' -and $A.NetBios -and $A.IsWindows) {
+        $nb = & nbtstat -A $Ip 2>$null | Select-String '<00>\s+UNIQUE' | Select-Object -First 1
+        if ($nb) { $name = ($nb.Line.Trim() -split '\s+')[0]; $src = 'netbios' }
+    }
     $open = @()
-    if (-not $NoPortScan) {
-        foreach ($p in $Ports) { if ((Test-Tcp $Ip $p $TimeoutMs) -eq 'open') { $open += $p } }
-    }
-    [pscustomobject]@{
-        IP        = $Ip
-        Hostname  = $name
-        OpenPorts = ($open -join ';')
-        SortKey   = [uint32]0
-    }
+    if (-not $A.NoPortScan) { foreach ($p in $A.Ports) { if ((Test-Tcp $Ip $p $A.TimeoutMs) -eq 'open') { $open += $p } } }
+    [pscustomobject]@{ IP = $Ip; Hostname = $name; NameSource = $src; DiscoveredBy = $via; OpenPorts = ($open -join ';') }
 }
 
-# ---- run the sweep -------------------------------------------------------------
-Write-Host ("Scanning {0} - {1} ({2} hosts, {3} threads, timeout {4} ms)" -f `
-    (ConvertTo-IpString $first), (ConvertTo-IpString $last), $count, $Threads, $TimeoutMs)
+$common = @{ Methods = $Methods; DiscPorts = $discPorts; TimeoutMs = $TimeoutMs; Ports = $Ports
+    NoPortScan = [bool]$NoPortScan; NetBios = $useNetbios; IsWindows = (Test-ToolIsWindows); KnownVia = $null }
+
+Write-ToolLog INFO ("scanning {0} - {1} ({2} hosts, methods {3}, {4} threads, timeout {5} ms)" -f `
+    (ConvertTo-IpString ([uint32]$range.First)), (ConvertTo-IpString ([uint32]$range.Last)), $range.Count, ($Methods -join ','), $Threads, $TimeoutMs)
 $started = Get-Date
+$ips = for ($i = $range.First; $i -le $range.Last; $i++) { ConvertTo-IpString ([uint32]$i) }
+$results = @(Invoke-ToolParallel -InputObject @($ips) -ScriptBlock $probe -ArgumentList $common -Throttle $Threads -Activity 'Sweeping')
 
-$pool = [RunspaceFactory]::CreateRunspacePool(1, $Threads)
-$pool.Open()
-$jobs = New-Object System.Collections.Generic.List[object]
-try {
-    for ($i = [uint64]$first; $i -le $last; $i++) {
-        $ps = [PowerShell]::Create()
-        $ps.RunspacePool = $pool
-        [void]$ps.AddScript($probe).AddArgument((ConvertTo-IpString ([uint32]$i))).AddArgument($Ports).AddArgument($TimeoutMs).AddArgument([bool]$NoPortScan)
-        $jobs.Add([pscustomobject]@{ PS = $ps; Handle = $ps.BeginInvoke() })
+# ---- ARP table: MAC addresses + hosts that only answered ARP ----------------------
+$macOf = @{}
+if ($Methods -contains 'arp' -or $NeighborFile) {
+    $seen = @{}; foreach ($r in $results) { $seen[$r.IP] = $true }
+    $arpOnly = @()
+    foreach ($n in (Get-NeighborTable -Path $NeighborFile)) {
+        $v = ConvertTo-UInt32 $n.IP
+        if ($v -lt $range.First -or $v -gt $range.Last) { continue }
+        $macOf[$n.IP] = $n.MAC
+        if (-not $seen.ContainsKey($n.IP)) { $arpOnly += $n.IP }
     }
-
-    $results = New-Object System.Collections.Generic.List[object]
-    $done = 0
-    foreach ($job in $jobs) {
-        foreach ($r in $job.PS.EndInvoke($job.Handle)) {
-            $r.SortKey = ConvertTo-UInt32 $r.IP
-            $results.Add($r)
-        }
-        $job.PS.Dispose()
-        $done++
-        if ($count -gt 1) {
-            Write-Progress -Activity 'Scanning' -Status "$done / $count" -PercentComplete ($done * 100 / $count)
-        }
+    if ($arpOnly) {
+        $arpArgs = $common.Clone(); $arpArgs.KnownVia = 'arp'
+        $results += @(Invoke-ToolParallel -InputObject $arpOnly -ScriptBlock $probe -ArgumentList $arpArgs -Throttle $Threads -Activity 'ARP hosts')
     }
-    Write-Progress -Activity 'Scanning' -Completed
-}
-finally {
-    $pool.Close(); $pool.Dispose()
 }
 
-$sorted = @($results | Sort-Object SortKey | Select-Object IP, Hostname, @{ n = 'OpenPorts'; e = { if ($_.OpenPorts) { $_.OpenPorts } else { '-' } } })
-$sorted | Format-Table -AutoSize | Out-String | Write-Host
+$oui = Import-OuiTable $ouiPath
+$rows = @($results | Sort-Object { ConvertTo-UInt32 $_.IP } | ForEach-Object {
+        $mac = if ($macOf.ContainsKey($_.IP)) { $macOf[$_.IP] } else { '-' }
+        [pscustomobject]@{
+            IP = $_.IP; MAC = $mac; Vendor = (Get-MacVendor $mac $oui); Hostname = $_.Hostname; NameSource = $_.NameSource
+            DiscoveredBy = $_.DiscoveredBy; OpenPorts = $(if ($_.OpenPorts) { $_.OpenPorts } else { '-' })
+        }
+    })
 $elapsed = [int]((Get-Date) - $started).TotalSeconds
-Write-Host ("{0} live host(s) found in {1}s." -f $sorted.Count, $elapsed)
+$rows | Format-Table IP, MAC, Vendor, Hostname, DiscoveredBy, OpenPorts -AutoSize | Out-String -Width 200 | Write-Host
+Write-Host ("{0} live host(s) out of {1} scanned in {2}s." -f $rows.Count, $range.Count, $elapsed)
 
-if ($CsvPath) {
-    $sorted | Export-Csv -Path $CsvPath -NoTypeInformation
-    Write-Host "CSV written to $CsvPath"
-}
+$summary = [ordered]@{ 'Live hosts' = $rows.Count; 'Addresses scanned' = $range.Count; 'Duration' = "${elapsed}s"; 'Methods' = ($Methods -join ',') }
+foreach ($out in $OutputPath) { Export-ToolReport -Path $out -Rows $rows -Title "Network scan: $Target" -Summary $summary -ToolName 'scan-network.ps1' }
 
-# Emit objects so the output can be piped (e.g. | Where-Object OpenPorts -match 22).
-$sorted
+# Objects go to the pipeline: .\scan-network.ps1 10.0.0.0/24 | Where-Object OpenPorts -match 22
+$rows

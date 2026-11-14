@@ -4,8 +4,12 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   lint-and-test:
+    name: Lint + tests (Ubuntu, bash + PowerShell 7)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -13,7 +17,7 @@ jobs:
       - name: ShellCheck
         run: |
           shellcheck --version
-          find . -name '*.sh' -print0 | xargs -0 shellcheck
+          find . -name '*.sh' -print0 | xargs -0 shellcheck -x
 
       - name: PSScriptAnalyzer
         shell: pwsh
@@ -24,5 +28,14 @@ jobs:
           $results | Format-Table -AutoSize
           if ($results) { exit 1 }
 
-      - name: Smoke tests
+      - name: Tests (bash + pwsh)
         run: bash tests/run-tests.sh
+
+  windows:
+    name: Windows PowerShell 5.1 smoke test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests/windows-smoke.ps1 under Windows PowerShell 5.1
+        shell: powershell
+        run: .\tests\windows-smoke.ps1
