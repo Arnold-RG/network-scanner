@@ -13,7 +13,7 @@ echo "== bash: localhost scan"
 out=$(./scan-network.sh -t 127.0.0.1 -p "22,$PORT" -o /tmp/ns-test.csv)
 echo "$out"
 grep -q "127.0.0.1" <<< "$out" || fail "127.0.0.1 not reported live"
-grep -q "127.0.0.1,.*,$PORT" /tmp/ns-test.csv || fail "open port $PORT missing from CSV"
+grep -Eq "^127\.0\.0\.1,[^,]*,([0-9]+;)*$PORT(;|$)" /tmp/ns-test.csv || fail "open port $PORT missing from CSV"
 
 echo "== bash: input validation"
 ./scan-network.sh -t 999.1.1.1/24 >/dev/null 2>&1 && fail "bad IP accepted"
