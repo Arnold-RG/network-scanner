@@ -1,10 +1,16 @@
-# Output produced by the scripts
+# Output produced by the tools
 *.csv
 *.json
+*.html
 *.log
+arp-baseline.txt
 reports/
 results/
-# Keep the synthetic demo data
+logs/
+# Keep bundled data, configs, fixtures and samples
+!data/**
+!config/**
+!tests/fixtures/**
 !samples/**
 # Editor / OS noise
 .vscode/

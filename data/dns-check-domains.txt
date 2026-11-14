@@ -1,0 +1,8 @@
+# Domains resolved by dns-analyzer. One per line, # starts a comment.
+# Pick domains you rely on (bank, mail, update servers) - poisoning and
+# hijacking usually target exactly those.
+example.com
+wikipedia.org
+github.com
+microsoft.com
+cloudflare.com

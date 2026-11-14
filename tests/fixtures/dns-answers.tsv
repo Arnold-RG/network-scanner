@@ -1,0 +1,14 @@
+# Synthetic answers for offline tests: domain<TAB>resolver<TAB>ips|NXDOMAIN|ERROR
+example.com	system	93.184.215.14
+example.com	1.1.1.1	93.184.215.14
+example.com	8.8.8.8	93.184.215.14
+example.com	9.9.9.9	93.184.215.14
+mybank.example	system	192.168.1.66
+mybank.example	1.1.1.1	203.0.113.10
+mybank.example	8.8.8.8	203.0.113.10
+mybank.example	9.9.9.9	ERROR
+shop.example	system	93.184.215.99
+shop.example	1.1.1.1	93.184.215.14,93.184.215.15
+shop.example	8.8.8.8	93.184.215.15
+shop.example	9.9.9.9	93.184.215.14
+NXTEST	system	198.51.100.250
