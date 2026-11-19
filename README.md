@@ -139,3 +139,17 @@ scanning may break your ISP's or employer's rules and, in many countries, the la
 ## License
 
 [MIT](LICENSE) - Copyright (c) 2026 Arnold Rurangwa
+
+---
+
+## Maintainer release checklist
+
+This tool makes active network probes. Run it **only against networks you own or are explicitly authorized to assess**. Do not confuse a ping response with proof that a host or service is secure.
+
+- **Windows:** validate the documented PowerShell entry point and CSV output against a controlled test subnet.
+- **Linux/macOS:** test bash requirements, timeouts, host detection and graceful behavior when optional utilities are unavailable.
+- **Reliability:** bound concurrency, handle unreachable addresses and document false negatives from filtering or offline hosts.
+- **CI/DevSecOps:** syntax checks, deterministic fixture tests and dependency/permissions review; report exact job results rather than claiming universal OS support.
+- **Documentation:** retain this README's real command examples and update them whenever flags or defaults change.
+
+No Kubernetes or cloud deployment is necessary for the command-line scanner.
